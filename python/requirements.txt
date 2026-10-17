@@ -1,3 +1,4 @@
 pydantic>=2.0
 requests>=2.28
 psycopg2-binary>=2.9
+fastembed>=0.4          # local multilingual embeddings (embed + cluster stages)

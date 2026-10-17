@@ -36,6 +36,10 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+
+class ExtractionError(RuntimeError):
+    """The model call failed or returned invalid output (not "no complaints")."""
+
 # ─── Prompt ────────────────────────────────────────────────────────────────
 
 PROMPT = """\
@@ -220,6 +224,7 @@ def extract_feedback(
     rate_limiter: Optional[TokenBucket] = None,
     monitor: Optional[ExtractionMonitor] = None,
     max_retries: int = 2,
+    raise_on_error: bool = False,
 ) -> list[Extraction]:
     """Send review text to an LLM and return validated Extraction objects.
 
@@ -229,8 +234,15 @@ def extract_feedback(
     - Pydantic schema validation
     - Token/cost/latency monitoring
 
-    Returns a list of validated Extraction objects (may be empty).
+    Returns a list of validated Extraction objects (may be empty). With
+    raise_on_error=True, failures raise ExtractionError instead of returning [],
+    so a queue worker can retry rather than record "no complaints".
     """
+    def give_up(reason: str) -> list[Extraction]:
+        if raise_on_error:
+            raise ExtractionError(reason)
+        return []
+
     est_tokens = max(200, len(review_text) // 4 + 500)
 
     if rate_limiter:
@@ -238,7 +250,7 @@ def extract_feedback(
             if monitor:
                 monitor.record(False, rate_limited=True)
             logger.warning("Rate limit exceeded, skipping extraction")
-            return []
+            return give_up("local rate limit budget exhausted")
 
     payload = {
         "model": model_key,
@@ -265,7 +277,7 @@ def extract_feedback(
                 if attempt < max_retries:
                     time.sleep(retry_after)
                     continue
-                return []
+                return give_up("provider rate limit (429)")
 
             r.raise_for_status()
             data = r.json()
@@ -289,7 +301,7 @@ def extract_feedback(
                         latency_ms=latency_ms,
                         validation_failed=True,
                     )
-                return []
+                return give_up(f"schema validation failed: {str(errors)[:300]}")
 
             if monitor:
                 monitor.record(
@@ -313,9 +325,9 @@ def extract_feedback(
                 continue
             if monitor:
                 monitor.record(False, latency_ms=latency_ms)
-            return []
+            return give_up(f"request failed: {e}")
 
-    return []
+    return give_up("no attempt succeeded")
 
 
 # ─── DB Integration ────────────────────────────────────────────────────────
@@ -328,19 +340,26 @@ def make_idempotency_key(review_id: int, prompt_version: str) -> str:
 
 
 def flush_monitor_to_db(monitor: ExtractionMonitor, db_conn) -> None:
-    """Write accumulated monitor metrics to extraction_metrics via upsert function."""
-    db_conn.execute(
-        "SELECT upsert_extraction_metrics(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-        (
-            monitor.model_key,
-            monitor.successful,
-            monitor.failed,
-            monitor.validation_failures,
-            monitor.tokens_input,
-            monitor.tokens_output,
-            monitor.cost_usd,
-            monitor.rate_limit_hits,
-            monitor.avg_latency_ms,
-            monitor.retries,
-        ),
-    )
+    """Add accumulated monitor metrics to extraction_metrics, then reset the
+    monitor so the next flush does not count the same calls twice."""
+    if monitor.total_requests == 0:
+        return
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT upsert_extraction_metrics(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                monitor.model_key,
+                monitor.successful,
+                monitor.failed,
+                monitor.validation_failures,
+                monitor.tokens_input,
+                monitor.tokens_output,
+                monitor.cost_usd,
+                monitor.rate_limit_hits,
+                monitor.avg_latency_ms,
+                monitor.retries,
+            ),
+        )
+    db_conn.commit()
+    model_key = monitor.model_key
+    monitor.__init__(model_key=model_key)
